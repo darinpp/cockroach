@@ -50,6 +50,8 @@ var serverSQLAddr, serverSQLPort string
 var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
 var serverHTTPAddr, serverHTTPPort string
 var localityAdvertiseHosts localityList
+var clockDevice string
+var hlcOnlyClockDevice bool
 
 // initPreFlagsDefaults initializes the values of the global variables
 // defined above.
@@ -356,6 +358,8 @@ func init() {
 		VarFlag(f, &serverCfg.Stores, cliflags.Store)
 		VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
 		VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
+		StringFlag(f, &clockDevice, cliflags.ClockDevice, "")
+		BoolFlag(f, &hlcOnlyClockDevice, cliflags.HlcOnlyClockDevice, false)
 
 		StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile, startCtx.listeningURLFile)
 
@@ -732,6 +736,9 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 			serverCfg.SocketFile = filepath.Join(serverSocketDir, ".s.PGSQL."+serverListenPort)
 		}
 	}
+
+	serverCfg.ClockDevice = clockDevice
+	serverCfg.HlcOnlyClockDevice = hlcOnlyClockDevice
 
 	// Fill in the defaults for --advertise-addr.
 	if serverAdvertiseAddr == "" {

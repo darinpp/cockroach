@@ -210,6 +210,10 @@ type Config struct {
 	// connections to determine connection health and update the local view
 	// of remote clocks.
 	RPCHeartbeatInterval time.Duration
+
+	// Enables the use of an IEEE 1588 PTP clock device for current time
+	ClockDevice        string
+	HlcOnlyClockDevice bool
 }
 
 func wrapError(err error) error {

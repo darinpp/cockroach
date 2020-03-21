@@ -380,9 +380,9 @@ func toggleSplitQueues(tc *testcluster.TestCluster, active bool) {
 func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testing.Short() || testutils.NightlyStress() || util.RaceEnabled {
-		t.Skip("https://github.com/cockroachdb/cockroach/issues/38565")
-	}
+	//if testing.Short() || testutils.NightlyStress() || util.RaceEnabled {
+	//	t.Skip("https://github.com/cockroachdb/cockroach/issues/38565")
+	//}
 	ctx := context.Background()
 
 	// Create a cluster with really small ranges.

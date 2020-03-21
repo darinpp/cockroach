@@ -664,6 +664,30 @@ fields.
 		Description: `Path to the CA key.`,
 	}
 
+	HlcOnlyClockDevice = FlagInfo{
+		Name: "hlc-only-clock-device",
+		Description: `
+Use the clock device only for Hlc clock
+<PRE>
+
+  --hlc-only-clock-device=true
+
+</PRE>
+`,
+	}
+
+	ClockDevice = FlagInfo{
+		Name: "clock-device",
+		Description: `
+Use IEEE 1588 PTP clock device for current time. 
+<PRE>
+
+  --clock-device=/dev/ptp0
+
+</PRE>
+`,
+	}
+
 	MaxOffset = FlagInfo{
 		Name: "max-offset",
 		Description: `
