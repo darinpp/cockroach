@@ -502,9 +502,10 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 		staleMsg = "(stale)"
 	}
 	goTotal := ms.Sys - ms.HeapReleased
+	curCalls, maxCalls := hlc.MutexClientCounts()
 	log.Infof(ctx, "runtime stats: %s RSS, %d goroutines, %s/%s/%s GO alloc/idle/total%s, "+
 		"%s/%s CGO alloc/total, %.1f CGO/sec, %.1f/%.1f %%(u/s)time, %.1f %%gc (%dx), "+
-		"%s/%s (r/w)net, timeutil.Now calls (all: %d, hlc: %d)",
+		"%s/%s (r/w)net, timeutil.Now calls (all: %d, hlc: %d, mutex cur: %d, mutex max: %d)",
 		humanize.IBytes(mem.Resident), numGoroutine,
 		humanize.IBytes(ms.HeapAlloc), humanize.IBytes(ms.HeapIdle), humanize.IBytes(goTotal),
 		staleMsg,
@@ -513,6 +514,8 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, ms GoMemSt
 		humanize.IBytes(deltaNet.BytesRecv), humanize.IBytes(deltaNet.BytesSent),
 		nowCallCountInc,
 		nowHlcCallCountInc,
+		curCalls,
+		maxCalls,
 	)
 	rsr.last.cgoCall = numCgoCall
 	rsr.last.gcCount = gc.NumGC

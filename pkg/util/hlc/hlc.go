@@ -250,6 +250,13 @@ func (c *Clock) setPhysicalClockAndCheckLocked(newTime int64) {
 	c.mu.lastPhysicalTime = newTime
 }
 
+var currentMutexClientCount int64
+var maxMutexClientCount int64
+
+func MutexClientCounts() (int64, int64) {
+	return currentMutexClientCount, maxMutexClientCount
+}
+
 // Now returns a timestamp associated with an event from
 // the local machine that may be sent to other members
 // of the distributed network. This is the counterpart
@@ -257,8 +264,13 @@ func (c *Clock) setPhysicalClockAndCheckLocked(newTime int64) {
 // another member of the distributed network.
 func (c *Clock) Now() Timestamp {
 	physicalClock := c.physicalClock()
+	atomic.AddInt64(&currentMutexClientCount, 1)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	last := atomic.AddInt64(&currentMutexClientCount, -1)
+	if maxMutexClientCount < last+1 {
+		maxMutexClientCount = last + 1
+	}
 	c.setPhysicalClockAndCheckLocked(physicalClock)
 	if c.mu.timestamp.WallTime >= physicalClock {
 		// The wall time is ahead, so the logical clock ticks.
