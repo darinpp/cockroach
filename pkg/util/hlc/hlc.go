@@ -16,6 +16,7 @@ package hlc
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 type Clock struct {
 	physicalClock func() int64
 	reqChannel    chan chan Timestamp
+	workerGroup   sync.WaitGroup
 
 	// The maximal offset of the HLC's wall time from the underlying physical
 	// clock. A well-chosen value is large enough to ignore a reasonable amount
@@ -136,24 +138,30 @@ func NewClock(physicalClock func() int64, maxOffset time.Duration) *Clock {
 		maxOffset:     maxOffset,
 	}
 	result.reqChannel = make(chan chan Timestamp)
-	for i := 0; i < 16; i++ {
+	numWorkers := 1
+	result.workerGroup.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
 		go result.requestProcessor()
 	}
+	result.workerGroup.Wait()
 
 	return result
 }
 
 func (c *Clock) requestProcessor() {
+	c.workerGroup.Done()
 	var clients [1000]chan Timestamp
 	for {
+		clients[0] = <-c.reqChannel
 		// Read until there is no more to read
-		i := int32(0)
-		for ; i < 1000; i++ {
+		i := int32(1)
+		hasMore := true
+		for i < 1000 && hasMore {
 			select {
 			case clients[i] = <-c.reqChannel:
 				i++
 			default:
-				break
+				hasMore = false
 			}
 		}
 		// do the call to the physical clock
