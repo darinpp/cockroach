@@ -43,6 +43,7 @@ import (
 // See NewClock for details.
 type Clock struct {
 	physicalClock func() int64
+	reqChannel    chan chan Timestamp
 
 	// The maximal offset of the HLC's wall time from the underlying physical
 	// clock. A well-chosen value is large enough to ignore a reasonable amount
@@ -130,9 +131,55 @@ func UnixNano() int64 {
 // A value of 0 for maxOffset means that clock skew checking, if performed on
 // this clock by RemoteClockMonitor, is disabled.
 func NewClock(physicalClock func() int64, maxOffset time.Duration) *Clock {
-	return &Clock{
+	result := &Clock{
 		physicalClock: physicalClock,
 		maxOffset:     maxOffset,
+	}
+	result.reqChannel = make(chan chan Timestamp)
+	for i := 0; i < 16; i++ {
+		go result.requestProcessor()
+	}
+
+	return result
+}
+
+func (c *Clock) requestProcessor() {
+	var clients [1000]chan Timestamp
+	for {
+		// Read until there is no more to read
+		i := int32(0)
+		for ; i < 1000; i++ {
+			select {
+			case clients[i] = <-c.reqChannel:
+				i++
+			default:
+				break
+			}
+		}
+		// do the call to the physical clock
+		physicalClock := c.physicalClock()
+		var time Timestamp
+		func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.setPhysicalClockAndCheckLocked(physicalClock)
+			if c.mu.timestamp.WallTime >= physicalClock {
+				// The wall time is ahead, so the logical clock ticks.
+				c.mu.timestamp.Logical++
+			} else {
+				// Use the physical clock, and reset the logical one.
+				c.mu.timestamp.WallTime = physicalClock
+				c.mu.timestamp.Logical = 0
+			}
+
+			c.enforceWallTimeWithinBoundLocked()
+			time = c.mu.timestamp
+			c.mu.timestamp.Logical += i
+		}()
+		for j := int32(0); j < i; j++ {
+			clients[j] <- time
+			time.Logical++
+		}
 	}
 }
 
@@ -263,26 +310,9 @@ func MutexClientCounts() (int64, int64) {
 // of Update, which is passed a timestamp received from
 // another member of the distributed network.
 func (c *Clock) Now() Timestamp {
-	physicalClock := c.physicalClock()
-	atomic.AddInt64(&currentMutexClientCount, 1)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	last := atomic.AddInt64(&currentMutexClientCount, -1)
-	if maxMutexClientCount < last+1 {
-		maxMutexClientCount = last + 1
-	}
-	c.setPhysicalClockAndCheckLocked(physicalClock)
-	if c.mu.timestamp.WallTime >= physicalClock {
-		// The wall time is ahead, so the logical clock ticks.
-		c.mu.timestamp.Logical++
-	} else {
-		// Use the physical clock, and reset the logical one.
-		c.mu.timestamp.WallTime = physicalClock
-		c.mu.timestamp.Logical = 0
-	}
-
-	c.enforceWallTimeWithinBoundLocked()
-	return c.mu.timestamp
+	reply := make(chan Timestamp, 1)
+	c.reqChannel <- reply
+	return <-reply
 }
 
 // enforceWallTimeWithinBoundLocked panics if the clock's wall time is greater
