@@ -119,6 +119,9 @@ type ProposalData struct {
 	// here; this could be replaced with isLease and isChangeReplicas
 	// booleans.
 	Request *roachpb.BatchRequest
+
+	// Indicates that this command was proposed previosuly w/o having Raft drop the command.
+	PreviouslyProposedWithoutDrop bool
 }
 
 // finishApplication is called when a command application has finished. The

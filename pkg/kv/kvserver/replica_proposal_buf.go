@@ -487,7 +487,18 @@ func (b *propBuf) FlushLockedWithRaftGroup(raftGroup *raft.RawNode) (int, error)
 	if firstErr != nil {
 		return 0, firstErr
 	}
-	return used, proposeBatch(raftGroup, b.p.replicaID(), ents)
+	err := proposeBatch(raftGroup, b.p.replicaID(), ents)
+	if !errors.Is(err, raft.ErrProposalDropped) {
+		buf := b.arr.asSlice()[:used]
+		for _, p := range buf {
+			if p != nil {
+				p.PreviouslyProposedWithoutDrop = true
+			}
+		}
+	} else {
+		err = nil
+	}
+	return used, err
 }
 
 func (b *propBuf) forwardLeaseIndexBase(v uint64) {
@@ -504,13 +515,7 @@ func proposeBatch(raftGroup *raft.RawNode, replID roachpb.ReplicaID, ents []raft
 		Type:    raftpb.MsgProp,
 		From:    uint64(replID),
 		Entries: ents,
-	}); errors.Is(err, raft.ErrProposalDropped) {
-		// Silently ignore dropped proposals (they were always silently
-		// ignored prior to the introduction of ErrProposalDropped).
-		// TODO(bdarnell): Handle ErrProposalDropped better.
-		// https://github.com/cockroachdb/cockroach/issues/21849
-		return nil
-	} else if err != nil {
+	}); err != nil {
 		return err
 	}
 	return nil
