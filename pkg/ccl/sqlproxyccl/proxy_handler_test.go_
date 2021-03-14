@@ -1,0 +1,725 @@
+//// Copyright 2021 The Cockroach Authors.
+////
+//// Licensed as a CockroachDB Enterprise file under the Cockroach Community
+//// License (the "License"); you may not use this file except in compliance with
+//// the License. You may obtain a copy of the License at
+////
+////     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+//
+//package sqlproxyccl
+//
+//import (
+//	"context"
+//	"crypto/tls"
+//	"fmt"
+//	"net"
+//	"net/url"
+//	"strings"
+//	"sync"
+//	"sync/atomic"
+//	"testing"
+//	"time"
+//
+//	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
+//	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+//	"github.com/cockroachdb/errors"
+//	"github.com/cockroachlabs/managed-service/intrusion/testutils"
+//	"github.com/fortytw2/leaktest"
+//	"github.com/gobuffalo/pop/v5"
+//	"github.com/jackc/pgproto3/v2"
+//	"github.com/jackc/pgx/v4"
+//	"github.com/stretchr/testify/require"
+//)
+//
+//const FrontendError = "Frontend error!"
+//const BackendError = "Backend error!"
+//
+//// This options are used to simplify the construction of test proxy handlers for
+//// the test cases below.
+//type testHandlerOptions struct {
+//	IncomingTLSConfig *tls.Config // config used for client -> proxy connection
+//
+//	// TLS settings to use when connecting to OutgoingAddress.
+//	BackendTLSConfig *tls.Config
+//
+//	// The address of the backend to connect to.
+//	OutgoingAddress string
+//
+//	// If set, will be called immediately after a new incoming connection
+//	// is accepted. It can optionally negotiate SSL, provide admittance control or
+//	// other types of frontend connection filtering.
+//	FrontendAdmitter func(incoming net.Conn) (net.Conn, *pgproto3.StartupMessage, error)
+//
+//	// If set, will be used to establish and return connection to the backend.
+//	// If not set, the old logic will be used.
+//	// The argument is the startup message received from the frontend. It
+//	// contains the protocol version and params sent by the client.
+//	BackendDialer func(msg *pgproto3.StartupMessage) (net.Conn, error)
+//
+//	// If set, consulted to decorate an error message to be sent to the client.
+//	// The error passed to this method will contain no internal information.
+//	OnSendErrToClient func(err error)
+//
+//	// If set, it will be called with the startup message received.
+//	InspectStartupMessage func(msg *pgproto3.StartupMessage, conn *sqlproxyccl.Conn)
+//
+//	// If set, consulted to modify the parameters set by the frontend before
+//	// forwarding them to the backend during startup.
+//	ModifyRequestParams func(map[string]string)
+//
+//	// Called after successfully connecting to OutgoingAddr.
+//	OnConnectionSuccess func()
+//
+//	// KeepAliveLoop if provided controls the lifetime of the proxy connection.
+//	// It will be run in its own goroutine when the connection is successfully
+//	// opened. Returning from `KeepAliveLoop` will close the proxy connection.
+//	// Note that non-nil error return values will be forwarded to the user and
+//	// hence should explain the reason for terminating the connection.
+//	// Most common use of KeepAliveLoop will be as an infinite loop that
+//	// periodically checks if the connection should still be kept alive. Hence it
+//	// may block indefinitely so it's prudent to use the provided context and
+//	// return on context cancellation.
+//	// See `TestProxyKeepAlive` for example usage.
+//	KeepAliveLoop func(context.Context) error
+//}
+//
+//func setupTestProxyWithCerts(
+//	t *testing.T, handler *ProxyHandler,
+//) (server *sqlproxyccl.Server, addr string, done func()) {
+//	// Created via:
+//	const _ = `
+//openssl genrsa -out testserver.key 2048
+//openssl req -new -x509 -sha256 -key testserver.key -out testserver.crt \
+//  -days 3650 -config testserver_config.cnf
+//`
+//	cer, err := tls.LoadX509KeyPair("testserver.crt", "testserver.key")
+//	require.NoError(t, err)
+//	handler.IncomingTLSConfig =
+//		&tls.Config{
+//			Certificates: []tls.Certificate{cer},
+//			ServerName:   "localhost",
+//		}
+//
+//	const listenAddress = "127.0.0.1:0"
+//	// NB: ln closes before wg.Wait or we deadlock.
+//	ln, err := net.Listen("tcp", listenAddress)
+//	require.NoError(t, err)
+//
+//	var wg sync.WaitGroup
+//	wg.Add(1)
+//
+//	done = func() {
+//		_ = ln.Close()
+//		wg.Wait()
+//	}
+//
+//	server = sqlproxyccl.NewServer(func(metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error {
+//		return handler.Handle(metrics, proxyConn)
+//	})
+//
+//	go func() {
+//		defer wg.Done()
+//		_ = server.Serve(ln)
+//	}()
+//
+//	return server, ln.Addr().String(), done
+//}
+//
+//func testingTenantIDFromDatabaseForAddr(
+//	addr string, validTenant string,
+//) func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//	return func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//		const dbKey = "database"
+//		p := msg.Parameters
+//		db, ok := p[dbKey]
+//		if !ok {
+//			return nil, sqlproxyccl.NewErrorf(
+//				sqlproxyccl.CodeParamsRoutingFailed, "need to specify database",
+//			)
+//		}
+//		sl := strings.SplitN(db, "_", 2)
+//		if len(sl) != 2 {
+//			return nil, sqlproxyccl.NewErrorf(
+//				sqlproxyccl.CodeParamsRoutingFailed, "malformed database name",
+//			)
+//		}
+//		db, tenantID := sl[0], sl[1]
+//
+//		if tenantID != validTenant {
+//			return nil, sqlproxyccl.NewErrorf(sqlproxyccl.CodeParamsRoutingFailed, "invalid tenantID")
+//		}
+//
+//		p[dbKey] = db
+//		return sqlproxyccl.BackendDial(msg, addr, &tls.Config{
+//			// NB: this would be false in production.
+//			InsecureSkipVerify: true,
+//		})
+//	}
+//}
+//
+//func runTestQuery(conn *pgx.Conn) error {
+//	var n int
+//	if err := conn.QueryRow(context.Background(), "SELECT $1::int", 1).Scan(&n); err != nil {
+//		return err
+//	}
+//	if n != 1 {
+//		return errors.Errorf("expected 1 got %d", n)
+//	}
+//	return nil
+//}
+//
+//type assertCtx struct {
+//	emittedCode *sqlproxyccl.ErrorCode
+//}
+//
+//func makeAssertCtx() assertCtx {
+//	var emittedCode sqlproxyccl.ErrorCode = -1
+//	return assertCtx{
+//		emittedCode: &emittedCode,
+//	}
+//}
+//
+//func (ac *assertCtx) onSendErrToClient(err error) {
+//	codeErr := (*sqlproxyccl.CodeError)(nil)
+//	if errors.As(err, &codeErr) {
+//		*ac.emittedCode = codeErr.Code
+//	}
+//}
+//
+//func (ac *assertCtx) assertConnectErr(
+//	t *testing.T, prefix, suffix string, expCode sqlproxyccl.ErrorCode, expErr string,
+//) {
+//	t.Helper()
+//	*ac.emittedCode = -1
+//	t.Run(suffix, func(t *testing.T) {
+//		ctx := context.Background()
+//		conn, err := pgx.Connect(ctx, prefix+suffix)
+//		if err == nil {
+//			_ = conn.Close(ctx)
+//		}
+//		require.Contains(t, err.Error(), expErr)
+//		require.Equal(t, expCode, *ac.emittedCode)
+//
+//	})
+//}
+//
+//func TestLongDBName(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ac := makeAssertCtx()
+//
+//	handler := &ProxyHandler{
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			return nil, sqlproxyccl.NewErrorf(sqlproxyccl.CodeParamsRoutingFailed, "boom")
+//		},
+//		OnSendErrToClient: ac.onSendErrToClient,
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, handler)
+//	defer done()
+//
+//	longDB := strings.Repeat("x", 70) // 63 is limit
+//	pgurl := fmt.Sprintf("postgres://unused:unused@%s/white-pony-5.%s", addr, longDB)
+//	ac.assertConnectErr(t, pgurl, "" /* suffix */, sqlproxyccl.CodeParamsRoutingFailed, "boom")
+//	require.Equal(t, int64(1), s.Metrics.RoutingErrCount.Count())
+//}
+//
+//func TestFailedConnection(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	// TODO(asubiotto): consider using datadriven for these, especially if the
+//	// proxy becomes more complex.
+//
+//	ac := makeAssertCtx()
+//	handler := &ProxyHandler{
+//		BackendDialer: testingTenantIDFromDatabaseForAddr(
+//			"undialable%$!@$", "29",
+//		),
+//		OnSendErrToClient: ac.onSendErrToClient,
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, handler)
+//	defer done()
+//
+//	_, p, err := net.SplitHostPort(addr)
+//	require.NoError(t, err)
+//	u := fmt.Sprintf("postgres://unused:unused@localhost:%s/white-pony-5.", p)
+//	// Valid connections, but no backend server running.
+//	for _, sslmode := range []string{"require", "prefer"} {
+//		ac.assertConnectErr(
+//			t, u, "defaultdb_29?sslmode="+sslmode,
+//			sqlproxyccl.CodeBackendDown, "unable to reach backend SQL server",
+//		)
+//	}
+//	ac.assertConnectErr(
+//		t, u, "defaultdb_29?sslmode=verify-ca&sslrootcert=testserver.crt",
+//		sqlproxyccl.CodeBackendDown, "unable to reach backend SQL server",
+//	)
+//	ac.assertConnectErr(
+//		t, u, "defaultdb_29?sslmode=verify-full&sslrootcert=testserver.crt",
+//		sqlproxyccl.CodeBackendDown, "unable to reach backend SQL server",
+//	)
+//	require.Equal(t, int64(4), s.Metrics.BackendDownCount.Count())
+//
+//	// Unencrypted connections bounce.
+//	for _, sslmode := range []string{"disable", "allow"} {
+//		ac.assertConnectErr(
+//			t, u, "defaultdb_29?sslmode="+sslmode,
+//			sqlproxyccl.CodeUnexpectedInsecureStartupMessage, "server requires encryption",
+//		)
+//	}
+//
+//	// TenantID rejected by test hook.
+//	ac.assertConnectErr(
+//		t, u, "defaultdb_28?sslmode=require",
+//		sqlproxyccl.CodeParamsRoutingFailed, "invalid tenantID",
+//	)
+//
+//	// No TenantID.
+//	ac.assertConnectErr(
+//		t, u, "defaultdb?sslmode=require",
+//		sqlproxyccl.CodeParamsRoutingFailed, "malformed database name",
+//	)
+//	require.Equal(t, int64(2), s.Metrics.RoutingErrCount.Count())
+//}
+//
+//func TestUnexpectedError(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	// Set up a Server whose proxy handler function always errors with a
+//	// non-CodeError error.
+//	ctx := context.Background()
+//	s := sqlproxyccl.NewServer(func(metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error {
+//		return errors.New("unexpected error")
+//	})
+//	const listenAddress = "127.0.0.1:0"
+//	ln, err := net.Listen("tcp", listenAddress)
+//	require.NoError(t, err)
+//	var wg sync.WaitGroup
+//	wg.Add(1)
+//	go func() {
+//		defer wg.Done()
+//		_ = s.Serve(ln)
+//	}()
+//	defer func() {
+//		_ = ln.Close()
+//		wg.Wait()
+//	}()
+//
+//	u := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&connect_timeout=5", ln.Addr().String())
+//
+//	// Time how long it takes for pgx.Connect to return. If the proxy handles
+//	// errors appropriately, pgx.Connect should return near immediately
+//	// because the server should close the connection. If not, it may take up
+//	// to the 5s connect_timeout for pgx.Connect to give up.
+//	start := timeutil.Now()
+//	_, err = pgx.Connect(ctx, u)
+//	require.Error(t, err)
+//	t.Log(err)
+//	elapsed := timeutil.Since(start)
+//	if elapsed >= 5*time.Second {
+//		t.Errorf("pgx.Connect took %s to error out", elapsed)
+//	}
+//}
+//
+//func TestProxyAgainstSecureCRDB(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx := context.Background()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	h, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	var connSuccess bool
+//	handler := &ProxyHandler{
+//		OnConnectionSuccess: func() { connSuccess = true },
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			delete(msg.Parameters, "crdb:remote_addr")
+//			return sqlproxyccl.BackendDial(msg, h.Host, nil)
+//		},
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, handler)
+//	defer done()
+//
+//	url := fmt.Sprintf("postgres://bob:wrong@%s/white-pony-5.defaultdb?sslmode=require", addr)
+//	_, err = pgx.Connect(context.Background(), url)
+//	require.True(t, testutils.IsError(err, "ERROR: password authentication failed for user bob"))
+//
+//	url = fmt.Sprintf("postgres://bob@%s/white-pony-5.defaultdb?sslmode=require", addr)
+//	_, err = pgx.Connect(context.Background(), url)
+//	require.True(t, testutils.IsError(err, "ERROR: password authentication failed for user bob"))
+//
+//	url = fmt.Sprintf("postgres://root:root@%s/white-pony-5.defaultdb?sslmode=require", addr)
+//	conn, err := pgx.Connect(context.Background(), url)
+//	require.NoError(t, err)
+//	defer func() {
+//		require.NoError(t, conn.Close(ctx))
+//		require.True(t, connSuccess)
+//		require.Equal(t, int64(1), s.Metrics.SuccessfulConnCount.Count())
+//		require.Equal(t, int64(2), s.Metrics.AuthFailedCount.Count())
+//	}()
+//
+//	require.Equal(t, int64(1), s.Metrics.CurConnCount.Value())
+//	require.NoError(t, runTestQuery(conn))
+//}
+//
+//func TestProxyTLSClose(t *testing.T) {
+//	defer leaktest.Check(t)()
+//	// NB: The leaktest call is an important part of this test. We're
+//	// verifying that no goroutines are leaked, despite calling Close an
+//	// underlying TCP connection (rather than the TLSConn that wraps it).
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	h, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	var proxyIncomingConn atomic.Value // *Conn
+//	var connSuccess bool
+//	handler := &ProxyHandler{
+//		InspectStartupMessage: func(msg *pgproto3.StartupMessage, conn *sqlproxyccl.Conn) {
+//			proxyIncomingConn.Store(conn)
+//		},
+//		OnConnectionSuccess: func() { connSuccess = true },
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			delete(msg.Parameters, "crdb:remote_addr")
+//			return sqlproxyccl.BackendDial(msg, h.Host, nil)
+//		},
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, handler)
+//	defer done()
+//
+//	url := fmt.Sprintf("postgres://root@%s/white-pony-5.defaultdb?sslmode=require", addr)
+//	conn, err := pgx.Connect(context.Background(), url)
+//	require.NoError(t, err)
+//	require.Equal(t, int64(1), s.Metrics.CurConnCount.Value())
+//	defer func() {
+//		incomingConn := proxyIncomingConn.Load().(*sqlproxyccl.Conn)
+//		require.NoError(t, incomingConn.Close())
+//		<-incomingConn.Done() // should immediately proceed
+//
+//		require.True(t, connSuccess)
+//		require.Equal(t, int64(1), s.Metrics.SuccessfulConnCount.Count())
+//		require.Equal(t, int64(0), s.Metrics.AuthFailedCount.Count())
+//	}()
+//
+//	require.NoError(t, runTestQuery(conn))
+//}
+//
+//func TestProxyModifyRequestParams(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx := context.Background()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	h, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	handler := &ProxyHandler{
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			params := msg.Parameters
+//			delete(params, "crdb:remote_addr")
+//			require.EqualValues(t, map[string]string{
+//				"authToken": "abc123",
+//				"user":      "bogususer",
+//				"database":  "defaultdb",
+//			}, params)
+//
+//			// NB: This test will fail unless the user used between the proxy
+//			// and the backend is changed to a user that actually exists.
+//			delete(params, "authToken")
+//			params["user"] = "root"
+//
+//			return sqlproxyccl.BackendDial(msg, h.Host, nil)
+//		},
+//	}
+//	s, proxyAddr, done := setupTestProxyWithCerts(t, handler)
+//	defer done()
+//
+//	u := fmt.Sprintf("postgres://bogususer@%s/white-pony-5.defaultdb?sslmode=require&authToken=abc123", proxyAddr)
+//	conn, err := pgx.Connect(ctx, u)
+//	require.NoError(t, err)
+//	require.Equal(t, int64(1), s.Metrics.CurConnCount.Value())
+//	defer func() {
+//		require.NoError(t, conn.Close(ctx))
+//	}()
+//
+//	require.NoError(t, runTestQuery(conn))
+//}
+//
+//func newInsecureProxyServer(
+//	t *testing.T, handler func(metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error,
+//) (server *sqlproxyccl.Server, addr string, cleanup func()) {
+//	s := sqlproxyccl.NewServer(handler)
+//	const listenAddress = "127.0.0.1:0"
+//	ln, err := net.Listen("tcp", listenAddress)
+//	require.NoError(t, err)
+//	var wg sync.WaitGroup
+//	wg.Add(1)
+//	go func() {
+//		defer wg.Done()
+//		_ = s.Serve(ln)
+//	}()
+//	return s, ln.Addr().String(), func() {
+//		_ = ln.Close()
+//		wg.Wait()
+//	}
+//}
+//
+//func TestInsecureProxy(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx := context.Background()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	h, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	_, addr, cleanup := newInsecureProxyServer(t, func(metrics *sqlproxyccl.Metrics, incoming *sqlproxyccl.Conn) error {
+//		conn, msg, err := sqlproxyccl.FrontendAdmit(incoming, nil)
+//		require.NoError(t, err)
+//		defer conn.Close()
+//		proxyConn, err := sqlproxyccl.BackendDial(msg, h.Host, nil)
+//		require.NoError(t, err)
+//		defer proxyConn.Close()
+//		require.NoError(t, sqlproxyccl.ConnectionCopy(proxyConn, conn))
+//		return nil
+//	})
+//	defer cleanup()
+//
+//	u := fmt.Sprintf("postgres://bob@%s?sslmode=disable", addr)
+//	_, err = pgx.Connect(context.Background(), u)
+//	require.Error(t, err)
+//	require.True(t, testutils.IsError(err, "ERROR: password authentication failed for user bob"))
+//
+//	u = fmt.Sprintf("postgres://root@%s/?sslmode=disable", addr)
+//	conn, err := pgx.Connect(ctx, u)
+//	require.NoError(t, err)
+//
+//	defer func() {
+//		require.NoError(t, conn.Close(ctx))
+//	}()
+//
+//	require.NoError(t, runTestQuery(conn))
+//}
+//
+//func TestInsecureDoubleProxy(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx := context.Background()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	h, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	// Test multiple proxies:  proxyB -> proxyA -> tc
+//	_, proxyA, cleanupA := newInsecureProxyServer(t, func(metrics *sqlproxyccl.Metrics, incoming *sqlproxyccl.Conn) error {
+//		conn, msg, err := sqlproxyccl.FrontendAdmit(incoming, nil)
+//		require.NoError(t, err)
+//		defer conn.Close()
+//		proxyConn, err := sqlproxyccl.BackendDial(msg, h.Host, nil)
+//		require.NoError(t, err)
+//		defer proxyConn.Close()
+//		require.NoError(t, sqlproxyccl.ConnectionCopy(proxyConn, conn))
+//		return nil
+//	})
+//	defer cleanupA()
+//	_, proxyB, cleanupB := newInsecureProxyServer(t, func(metrics *sqlproxyccl.Metrics, incoming *sqlproxyccl.Conn) error {
+//		conn, msg, err := sqlproxyccl.FrontendAdmit(incoming, nil)
+//		require.NoError(t, err)
+//		defer conn.Close()
+//		proxyConn, err := sqlproxyccl.BackendDial(msg, proxyA, nil)
+//		require.NoError(t, err)
+//		defer proxyConn.Close()
+//		require.NoError(t, sqlproxyccl.ConnectionCopy(proxyConn, conn))
+//		return nil
+//	})
+//	defer cleanupB()
+//
+//	u := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable", proxyB)
+//	conn, err := pgx.Connect(ctx, u)
+//	require.NoError(t, err)
+//
+//	defer func() {
+//		require.NoError(t, conn.Close(ctx))
+//	}()
+//
+//	require.NoError(t, runTestQuery(conn))
+//}
+//
+//func TestErroneousFrontend(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	defer cancel()
+//
+//	_, addr, cleanup := newInsecureProxyServer(
+//		t,
+//		func(metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error {
+//			handler := &ProxyHandler{
+//				FrontendAdmitter: func(incoming net.Conn) (net.Conn, *pgproto3.StartupMessage, error) {
+//					return incoming, nil, sqlproxyccl.NewErrorf(sqlproxyccl.CodeClientDisconnected, FrontendError)
+//				},
+//			}
+//			return handler.Handle(metrics, proxyConn)
+//		},
+//	)
+//	defer cleanup()
+//
+//	u := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable", addr)
+//
+//	_, err := pgx.Connect(ctx, u)
+//	require.Error(t, err)
+//	require.Regexp(t, FrontendError, err)
+//}
+//
+//func TestErroneousBackend(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	defer cancel()
+//
+//	_, addr, cleanup := newInsecureProxyServer(
+//		t,
+//		func(metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error {
+//			handler := &ProxyHandler{
+//				BackendDialer: func(message *pgproto3.StartupMessage) (net.Conn, error) {
+//					return nil, sqlproxyccl.NewErrorf(sqlproxyccl.CodeBackendDisconnected, BackendError)
+//				},
+//			}
+//			return handler.Handle(metrics, proxyConn)
+//		},
+//	)
+//	defer cleanup()
+//
+//	u := fmt.Sprintf("postgres://bob:builder@%s/white-pony-5.defaultdb?sslmode=disable", addr)
+//
+//	_, err := pgx.Connect(ctx, u)
+//	require.Error(t, err)
+//	require.Regexp(t, BackendError, err)
+//}
+//
+//func TestProxyRefuseConn(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	ac := makeAssertCtx()
+//	handler := ProxyHandler{
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			return nil, sqlproxyccl.NewErrorf(sqlproxyccl.CodeProxyRefusedConnection, "too many attempts")
+//		},
+//		OnSendErrToClient: ac.onSendErrToClient,
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, &handler)
+//	defer done()
+//
+//	ac.assertConnectErr(
+//		t, fmt.Sprintf("postgres://root:admin@%s/", addr), "white-pony-5.defaultdb_29?sslmode=require",
+//		sqlproxyccl.CodeProxyRefusedConnection, "too many attempts",
+//	)
+//	require.Equal(t, int64(1), s.Metrics.RefusedConnCount.Count())
+//	require.Equal(t, int64(0), s.Metrics.SuccessfulConnCount.Count())
+//	require.Equal(t, int64(0), s.Metrics.AuthFailedCount.Count())
+//}
+//
+//func TestProxyKeepAlive(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	u, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	handler := ProxyHandler{
+//		KeepAliveLoop: func(ctx context.Context) error {
+//			t := timeutil.NewTimer()
+//			t.Reset(100 * time.Millisecond)
+//			for {
+//				select {
+//				case <-ctx.Done():
+//					return ctx.Err()
+//				case <-t.C:
+//					t.Read = true
+//					return errors.New("expired")
+//				}
+//			}
+//		},
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			delete(msg.Parameters, "crdb:remote_addr")
+//			return sqlproxyccl.BackendDial(msg, u.Host, nil)
+//		},
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, &handler)
+//	defer done()
+//
+//	url := fmt.Sprintf("postgres://root:admin@%s/white-pony-5.defaultdb_29?sslmode=require", addr)
+//	conn, err := pgx.Connect(context.Background(), url)
+//	require.NoError(t, err)
+//	defer func() {
+//		require.NoError(t, conn.Close(context.Background()))
+//		require.Equal(t, int64(1), s.Metrics.ExpiredClientConnCount.Count())
+//	}()
+//
+//	require.Eventuallyf(
+//		t,
+//		func() bool {
+//			_, err = conn.Exec(context.Background(), "SELECT 1")
+//			return err != nil && strings.Contains(err.Error(), "expired")
+//		},
+//		time.Second, 5*time.Millisecond,
+//		"unexpected error received: %v", err,
+//	)
+//}
+//
+//func TestProxyAgainstTestCRDBWithIdleTimeout(t *testing.T) {
+//	defer leaktest.Check(t)()
+//
+//	err := pop.LoadConfigFile()
+//	require.NoError(t, err)
+//
+//	u, err := url.Parse(pop.Connections["test"].URL())
+//	require.NoError(t, err)
+//
+//	idleTimeout, _ := time.ParseDuration("0.5s")
+//	var connSuccess bool
+//
+//	handler := ProxyHandler{
+//		OnConnectionSuccess: func() { connSuccess = true },
+//		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
+//			delete(msg.Parameters, "crdb:remote_addr")
+//			conn, err := sqlproxyccl.BackendDial(msg, u.Host, nil)
+//			if err != nil {
+//				return nil, err
+//			}
+//			return sqlproxyccl.IdleDisconnectOverlay(conn, idleTimeout), nil
+//		},
+//	}
+//	s, addr, done := setupTestProxyWithCerts(t, &handler)
+//	defer done()
+//
+//	url := fmt.Sprintf("postgres://root:admin@%s/white-pony-5.defaultdb_29?sslmode=require", addr)
+//	conn, err := pgx.Connect(context.Background(), url)
+//	require.NoError(t, err)
+//	require.Equal(t, int64(1), s.Metrics.CurConnCount.Value())
+//	defer func() {
+//		require.NoError(t, conn.Close(context.Background()))
+//		require.True(t, connSuccess)
+//		require.Equal(t, int64(1), s.Metrics.SuccessfulConnCount.Count())
+//	}()
+//
+//	var n int
+//	err = conn.QueryRow(context.Background(), "SELECT $1::int", 1).Scan(&n)
+//	require.NoError(t, err)
+//	require.EqualValues(t, 1, n)
+//	time.Sleep(idleTimeout * 2)
+//	err = conn.QueryRow(context.Background(), "SELECT $1::int", 1).Scan(&n)
+//	require.EqualError(t, err, "FATAL: terminating connection due to idle timeout (SQLSTATE 57P01)")
+//}

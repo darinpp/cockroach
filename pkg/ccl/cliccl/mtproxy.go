@@ -10,179 +10,95 @@ package cliccl
 
 import (
 	"context"
-	"crypto/tls"
-	"io/ioutil"
 	"net"
-	"strings"
+	"time"
 
-	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgproto3/v2"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
 
-var sqlProxyListenAddr, sqlProxyTargetAddr string
-var sqlProxyListenCert, sqlProxyListenKey string
+var options sqlproxyccl.ProxyOptions
 
 func init() {
 	startSQLProxyCmd := &cobra.Command{
 		Use:   "start-proxy <basepath>",
 		Short: "start-proxy host:port",
-		Long: `Starts a SQL proxy for testing purposes.
+		Long: `Starts a SQL proxy.
 
-This proxy provides very limited functionality. It accepts incoming connections
-and relays them to the specified backend server after verifying that at least
-one of the following holds:
-
-1. the supplied database name is prefixed with 'prancing-pony.'; this prefix
-   will then be removed for the connection to the backend server, and/or
-2. the options parameter is 'prancing-pony'.
-
-Connections to the target address use TLS but do not identify the identity of
-the peer, making them susceptible to MITM attacks.
+This proxy accepts incoming connections and relays them to a backend server
+determined by the arguments used.
 `,
 		RunE: cli.MaybeDecorateGRPCError(runStartSQLProxy),
 		Args: cobra.NoArgs,
 	}
 	f := startSQLProxyCmd.Flags()
-	f.StringVarP(&sqlProxyListenCert, "listen-cert", "", "", "Certificate file to use for listener (auto-generate if empty)")
-	f.StringVarP(&sqlProxyListenKey, "listen-key", "", "", "Private key file to use for listener(auto-generate if empty)")
-	f.StringVarP(&sqlProxyListenAddr, "listen-addr", "", "127.0.0.1:46257", "Address for incoming connections")
-	f.StringVarP(&sqlProxyTargetAddr, "target-addr", "", "127.0.0.1:26257", "Address for outgoing connections")
+	f.StringVar(&options.Denylist, "denylist-file", "",
+		"Denylist file to limit access to IP addresses and tenant ids.")
+	f.StringVar(&options.ListenAddr, "listen-addr", "127.0.0.1:46257",
+		"Listen address for incoming connections.")
+	f.StringVar(&options.ListenCert, "listen-cert", "",
+		"File containing PEM-encoded x509 certificate for listen address.")
+	f.StringVar(&options.ListenKey, "listen-key", "",
+		"File containing PEM-encoded x509 key for listen address.")
+	f.StringVar(&options.MetricsAddress, "listen-metrics", "0.0.0.0:8080",
+		"Listen address for incoming connections.")
+	f.StringVar(&options.RoutingRule, "routing-rule", "",
+		"Routing rule for incoming connections. Use '{{clusterName}}' for substitution.")
+	f.BoolVar(&options.Verify, "verify", true,
+		"If false, skip identity verification of the SQL pods. For testing only.")
+	f.DurationVar(&options.RatelimitBaseDelay, "ratelimit-base-delay", 50*time.Millisecond,
+		"Initial backoff after a failed login attempt. Set to 0 to disable rate limiting.")
+	f.DurationVar(&options.ValidateAccessInterval, "validate-access-interval", 30*time.Second,
+		"Time interval between validation that current connections are still valid.")
+	f.DurationVar(&options.PollConfigInterval, "poll-config-interval", 30*time.Second,
+		"Polling interval changes in config file.")
 	cli.AddMTCommand(startSQLProxyCmd)
 }
 
 func runStartSQLProxy(*cobra.Command, []string) error {
-	// openssl genrsa -out testserver.key 2048
-	// openssl req -new -x509 -sha256 -key testserver.key -out testserver.crt -days 3650
-	// ^-- Enter * as Common Name below, rest can be empty.
-	certBytes := []byte(`-----BEGIN CERTIFICATE-----
-MIICpDCCAYwCCQDWdkou+YTT/DANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAls
-b2NhbGhvc3QwHhcNMjAwNTIwMTQxMjIyWhcNMzAwNTE4MTQxMjIyWjAUMRIwEAYD
-VQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDG
-H6V5TZjppRR61azexRtKLOnftVpO0+CPslHynbWwrJ6sxZIdglUWoCT3a/93tq0h
-SaMWIxH+29wDXiICCTbr485h3Sov5Rq7kV/AwcLMOpdqjbN2PRBW95aq8rV3h/Ui
-K3hu8OZjeh4DzhxsDWYwLG+1aUHnzpwDVIvXqiiKHVtT3WLDHRNUAuph9o/4Fao0
-m1KAzXvfbnNyMUWTAOUCIX2tlq79rEIAKOySCKDr07TuVrzCKcF5sbXkFXlmyFNl
-KbmXRuD3UxghxLMmUZar7eZR84x6R/Rj5Dqyrs3nfl+/30Zk0pNe6naaKO39zqlR
-rWQIqwSZrY1HwGGeVJFjAgMBAAEwDQYJKoZIhvcNAQELBQADggEBACluo7vP0kXd
-uXD3joPKiMJ0FgZqeDtuSvBPfl0okqPN+bk/Huqu+FgxfChCs+2EcreGFxshjzuv
-J58ogFq1YMB4pS4GlqarHE+UdliOobD+OyvX40w9lTJ2wI+v7kI79udFE+tyLIs6
-YkuzFd1nB0Zcf8QFzyPRTVXVpsWid3ZvARDakp4z7klPLnkfVrXo/ivlKqGF+Ymy
-vJ/riLR01omTVi6W40cml/H4DAtG/XVsQeFXWpjUv97MWGRVYycmpCleVkK+uC2x
-XAEi/UMoPhhJd6HEWG+56IkFFoN4lNtPuyal0vzOJCn70pgQx3yKh61RQcPrJMlD
-m9qz1xbrzj8=
------END CERTIFICATE-----
-`)
-	keyBytes := []byte(`-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAxh+leU2Y6aUUetWs3sUbSizp37VaTtPgj7JR8p21sKyerMWS
-HYJVFqAk92v/d7atIUmjFiMR/tvcA14iAgk26+POYd0qL+Uau5FfwMHCzDqXao2z
-dj0QVveWqvK1d4f1Iit4bvDmY3oeA84cbA1mMCxvtWlB586cA1SL16ooih1bU91i
-wx0TVALqYfaP+BWqNJtSgM17325zcjFFkwDlAiF9rZau/axCACjskgig69O07la8
-winBebG15BV5ZshTZSm5l0bg91MYIcSzJlGWq+3mUfOMekf0Y+Q6sq7N535fv99G
-ZNKTXup2mijt/c6pUa1kCKsEma2NR8BhnlSRYwIDAQABAoIBADFpiSKUyNNU2aO9
-EO1KaYD5bKbfmxNX4oTUK33/+WWD19stN0Dm1YPcEvwmUkOwKsPHksYdnwpaGSg5
-3O93DtyMJ1ffCfuB/0XSfvgbGxNGdacciiquFhoqi8g82idioC+SeenpaPxcY4n9
-aLdGLDtNidrL0qUWsXBfMLVr+cpgENPMiri31CGLNpfO1b4icdQjiltEn70To2Al
-68Ptar60m/lJzf8QMFSf499/W3b7fLjGFK+Gzump94xAVMd7HhACf42ZpWRPe1Ih
-lyHP6D0091cIRhGxIZrhLToSuySpf1A+C/rQYTqzEPv/a3b4Ja6poulpBppwJyDa
-roC4KtkCgYEA/h0HRzekvNAg2cOV/Ag1RyE4AmdyCDubBHcPNJi9kI/RsA0RgurO
-pr2oET0HWTENgE4e4hYQnlqUvTXYisvtvhigiCkcynpGoMJa5Y4St7J1QKdQtuwY
-vcRqOGGSKl73biK79+BIV/6swWCkB+VzoGzKP8dY/XZHsI0FDdnia8UCgYEAx5gz
-9qfzfiqOQP/GN6vGIzoldGxCDCHyyEZmvy0FiBlMJK36Qkjtz48eqYEXOUCX8Z5X
-gB583iMv72Oz/wmefoIjnUd9uXyMqvhnYxG4vQhU4a83K4q4TPkNd7+sLiNqxIq2
-o2jT6BktOHE5OiICeFGMFOfHtsyV78JMsuzUEwcCgYAXU5LXdsQokPJzCwE5oYdC
-gEoj7lsJZm9UeZlrupmsK4eUIZ755ZQSulYzPubtyRL0NDehiWT9JFODCu5Vz2KD
-kL8rwJpj+9V/7Fdrux78veUFilZedE3RHbaidlJ0kUMlWQroNi5t5XL2TWjBUM7M
-azAlqqcAnVr3WfqcyuN+AQKBgQCsz+xV6I7bMy9dudc+hlyUTZj2V3FMHeyeWM5H
-QkzizLxvma7vy0MUDd/HdTzNVk74ZVdvV3ZXwvGS/Klw7TwsXrNFTwvdGKiWs2KY
-lVR1XwxXJyTGb2IpSw3NG8iRXhroNw3xKCcpcvsDPo0E90NaN4jo5NG3RSWgpINR
-+9mW6wKBgCze3gZB6AU0W/Fluql88ANx/+nqZhrsJyfrv87AkgDtt0o1tOj+emKR
-Uuwb2FVdh76ZK0AVd3Jh3KJs4+hr2u9syHaa7UPKXTcZsFWlGwZuu6X5A+0SO0S2
-/ur8gv24YZJvV7OvPhw1SAuYL7MKMsfTW4TEKWTfkZWvm4YfZNmR
------END RSA PRIVATE KEY-----
-`)
+	// TODO(chrisseto): Support graceful shutdown.
+	// Our health check server is configured correctly but the proxy, itself,
+	// is another story as it doesn't take any contexts to begin with.
+	ctx := context.Background()
 
-	if (sqlProxyListenKey == "") != (sqlProxyListenCert == "") {
-		return errors.New("must specify either both or neither of cert and key")
+	proxyLn, err := net.Listen("tcp", options.ListenAddr)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = proxyLn.Close() }()
 
-	if sqlProxyListenCert != "" {
-		var err error
-		certBytes, err = ioutil.ReadFile(sqlProxyListenCert)
-		if err != nil {
-			return err
-		}
+	metricsLn, err := net.Listen("tcp", options.MetricsAddress)
+	if err != nil {
+		return err
 	}
-	if sqlProxyListenKey != "" {
-		var err error
-		keyBytes, err = ioutil.ReadFile(sqlProxyListenKey)
-		if err != nil {
-			return err
-		}
-	}
+	defer func() { _ = metricsLn.Close() }()
 
-	cer, err := tls.X509KeyPair(certBytes, keyBytes)
+	handler, err := sqlproxyccl.NewProxyHandler(ctx, options)
 	if err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", sqlProxyListenAddr)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = ln.Close() }()
-
-	// Multiplex the listen address to give easy access to metrics from this
-	// command.
-	mux := cmux.New(ln)
-	httpLn := mux.Match(cmux.HTTP1Fast())
-	proxyLn := mux.Match(cmux.Any())
-
-	outgoingConf := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-	server := sqlproxyccl.NewServer(sqlproxyccl.Options{
-		FrontendAdmitter: func(incoming net.Conn) (net.Conn, *pgproto3.StartupMessage, error) {
-			return sqlproxyccl.FrontendAdmit(
-				incoming,
-				&tls.Config{
-					Certificates: []tls.Certificate{cer},
-				},
-			)
-		},
-		BackendDialer: func(msg *pgproto3.StartupMessage) (net.Conn, error) {
-			params := msg.Parameters
-			const magic = "prancing-pony"
-			if strings.HasPrefix(params["database"], magic+".") {
-				params["database"] = params["database"][len(magic)+1:]
-			} else if params["options"] != "--cluster="+magic {
-				return nil, errors.Errorf("client failed to pass '%s' via database or options", magic)
-			}
-			conn, err := sqlproxyccl.BackendDial(msg, sqlProxyTargetAddr, outgoingConf)
-			if err != nil {
-				return nil, err
-			}
-			return conn, nil
-		},
+	server := sqlproxyccl.NewServer(func(ctx context.Context, metrics *sqlproxyccl.Metrics, proxyConn *sqlproxyccl.Conn) error {
+		return handler.Handle(ctx, metrics, proxyConn)
 	})
 
-	group, ctx := errgroup.WithContext(context.Background())
+	group, ctx := errgroup.WithContext(ctx)
 
 	group.Go(func() error {
-		return server.ServeHTTP(ctx, httpLn)
+		log.Infof(ctx, "HTTP metrics server started at %s", metricsLn.Addr())
+		return errors.Wrap(server.ServeHTTP(ctx, metricsLn), " HTTP server failed")
 	})
 
 	group.Go(func() error {
-		return server.Serve(proxyLn)
-	})
-
-	group.Go(func() error {
-		return mux.Serve()
+		log.Infof(ctx, "proxy server started at ", proxyLn.Addr())
+		return errors.Wrap(server.Serve(ctx, proxyLn), "proxy server failed")
 	})
 
 	return group.Wait()
+
+	return nil
 }

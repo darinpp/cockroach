@@ -11,12 +11,17 @@ go_library(
         "idle_disconnect_connection.go",
         "metrics.go",
         "proxy.go",
+        "proxy_handler.go",
         "server.go",
         ":gen-errorcode-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/ccl/sqlproxyccl/admitter",
+        "//pkg/ccl/sqlproxyccl/cache",
+        "//pkg/ccl/sqlproxyccl/denylist",
+        "//pkg/util",
         "//pkg/util/contextutil",
         "//pkg/util/httputil",
         "//pkg/util/log",
@@ -24,7 +29,9 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_jackc_pgproto3_v2//:pgproto3",
+        "@com_github_spf13_viper//:viper",
     ],
 )
 
@@ -42,14 +49,12 @@ go_test(
     embed = [":sqlproxyccl"],
     tags = ["broken_in_bazel"],
     deps = [
-        "//pkg/base",
         "//pkg/ccl/utilccl",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
-        "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
