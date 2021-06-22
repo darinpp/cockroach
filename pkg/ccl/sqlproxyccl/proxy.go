@@ -25,13 +25,13 @@ var pgSSLRequest = []int32{8, 80877103}
 // the transmission of the err back to the client.
 func updateMetricsAndSendErrToClient(err error, conn net.Conn, metrics *metrics) {
 	metrics.updateForError(err)
-	sendErrToClient(conn, err)
+	SendErrToClient(conn, err)
 }
 
-// sendErrToClient will encode and pass back to the SQL client an error message.
+// SendErrToClient will encode and pass back to the SQL client an error message.
 // It can be called by the implementors of proxyHandler to give more
 // information to the end user in case of a problem.
-var sendErrToClient = func(conn net.Conn, err error) {
+var SendErrToClient = func(conn net.Conn, err error) {
 	if err == nil || conn == nil {
 		return
 	}

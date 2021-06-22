@@ -19,10 +19,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// backendLookupAddr looks up the given address using usual DNS resolution
+// BackendLookupAddr looks up the given address using usual DNS resolution
 // mechanisms. It returns the first resolved address, or an error if the lookup
 // failed in some way. This can be overridden in tests.
-var backendLookupAddr = func(addr string) (string, error) {
+var BackendLookupAddr = func(addr string) (string, error) {
 	names, err := net.LookupAddr(addr)
 	if err != nil || len(names) == 0 {
 		// Assume that any errors are due to missing or mismatched tenant.
@@ -31,10 +31,10 @@ var backendLookupAddr = func(addr string) (string, error) {
 	return names[0], nil
 }
 
-// backendDial is an example backend dialer that does a TCP/IP connection
+// BackendDial is an example backend dialer that does a TCP/IP connection
 // to a backend, SSL and forwards the start message. It is defined as a variable
 // so it can be redirected for testing.
-var backendDial = func(
+var BackendDial = func(
 	msg *pgproto3.StartupMessage, outgoingAddress string, tlsConfig *tls.Config,
 ) (net.Conn, error) {
 	conn, err := net.Dial("tcp", outgoingAddress)

@@ -182,10 +182,10 @@ func newProxyHandler(
 // handle is called by the proxy server to handle a single incoming client
 // connection.
 func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn) error {
-	conn, msg, err := frontendAdmit(incomingConn, handler.incomingTLSConfig())
+	conn, msg, err := FrontendAdmit(incomingConn, handler.incomingTLSConfig())
 	defer func() { _ = conn.Close() }()
 	if err != nil {
-		sendErrToClient(conn, err)
+		SendErrToClient(conn, err)
 		return err
 	}
 
@@ -273,7 +273,7 @@ func (handler *proxyHandler) handle(ctx context.Context, incomingConn *proxyConn
 		}
 
 		// Now actually dial the backend server.
-		crdbConn, err = backendDial(backendStartupMsg, outgoingAddress, TLSConf)
+		crdbConn, err = BackendDial(backendStartupMsg, outgoingAddress, TLSConf)
 
 		// If we get a backend down error, retry the connection.
 		var codeErr *codeError
@@ -417,7 +417,7 @@ func (handler *proxyHandler) outgoingAddress(
 	addr := strings.ReplaceAll(
 		handler.RoutingRule, "{{clusterName}}", fmt.Sprintf("%s-%d", name, tenID.ToUint64()),
 	)
-	_, err := backendLookupAddr(addr)
+	_, err := BackendLookupAddr(addr)
 	if err != nil {
 		return "", status.Error(codes.NotFound, err.Error())
 	}
